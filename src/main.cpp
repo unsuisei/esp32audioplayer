@@ -169,7 +169,7 @@ void setup() {
     // Configure Audio
     out = new AudioOutputI2S(0, AudioOutputI2S::INTERNAL_DAC);
     out->SetOutputModeMono(true);
-    out->SetGain(0.1); // Volume level
+    out->SetGain(0.08); // Volume level
 
     mp3 = new AudioGeneratorMP3();
 
