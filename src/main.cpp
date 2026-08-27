@@ -12,7 +12,8 @@
 
 // Hardware Pins
 #define SD_CS 5
-#define BOOT_BUTTON_PIN 0  // Onboard BOOT button
+#define BOOT_BUTTON_PIN 0  // Play / Pause / Skip (BOOT button)
+#define VOL_BUTTON_PIN 32  // 3-Pin Volume Cycle Button
 
 // OLED Configuration
 #define SCREEN_WIDTH 128
@@ -20,6 +21,12 @@
 #define OLED_RESET -1
 #define SCREEN_ADDRESS 0x3C
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Audio Volume Presets (Gain values safe for PAM8403)
+const float volumeLevels[] = {0.02f, 0.05f, 0.10f, 0.18f, 0.25f};
+const int volumePercentages[] = {8, 20, 40, 72, 100};
+const int TOTAL_VOL_STEPS = 5;
+int currentVolIndex = 1; // Default starting index (0.05f / 20%)
 
 // Global Audio Objects
 AudioGeneratorMP3 *mp3 = nullptr;
@@ -31,9 +38,12 @@ std::vector<String> playlist;
 size_t currentTrackIndex = 0;
 bool isPaused = false;
 
-// Button Debounce & Press Time Variables
-unsigned long buttonPressTime = 0;
-bool buttonWasPressed = false;
+// Button Debounce States
+unsigned long bootPressTime = 0;
+bool bootWasPressed = false;
+
+unsigned long volPressTime = 0;
+bool volWasPressed = false;
 
 void updateDisplay(const char* status, String trackName) {
     display.clearDisplay();
@@ -51,17 +61,23 @@ void updateDisplay(const char* status, String trackName) {
     }
 
     // Track Name
-    display.setCursor(0, 24);
+    display.setCursor(0, 22);
     display.print("Track: ");
     display.println(trackName);
 
+    // Volume Level Display
+    display.setCursor(0, 38);
+    display.print("Volume: ");
+    display.print(volumePercentages[currentVolIndex]);
+    display.println("%");
+
     // Status / Track Counter
-    display.setCursor(0, 48);
+    display.setCursor(0, 52);
     display.print("Status: ");
     display.print(status);
     
     if (!playlist.empty()) {
-        display.setCursor(95, 48);
+        display.setCursor(95, 52);
         display.printf("[%d/%d]", currentTrackIndex + 1, playlist.size());
     }
 
@@ -93,7 +109,7 @@ void scanSDCard() {
 void playTrack(size_t index) {
     if (playlist.empty()) return;
 
-    isPaused = false; // Reset pause status on new track
+    isPaused = false;
 
     if (file) {
         delete file;
@@ -110,31 +126,25 @@ void playTrack(size_t index) {
     }
 }
 
-void handleButton() {
-    bool isPressed = (digitalRead(BOOT_BUTTON_PIN) == LOW); // Pressed = LOW
+// Handles Play / Pause (Short Press) and Skip Track (Long Press)
+void handleBootButton() {
+    bool isPressed = (digitalRead(BOOT_BUTTON_PIN) == LOW);
 
-    // Button state transitions to PRESSED
-    if (isPressed && !buttonWasPressed) {
-        buttonPressTime = millis();
-        buttonWasPressed = true;
+    if (isPressed && !bootWasPressed) {
+        bootPressTime = millis();
+        bootWasPressed = true;
     }
 
-    // Button state transitions to RELEASED
-    if (!isPressed && buttonWasPressed) {
-        unsigned long pressDuration = millis() - buttonPressTime;
-        buttonWasPressed = false;
+    if (!isPressed && bootWasPressed) {
+        unsigned long pressDuration = millis() - bootPressTime;
+        bootWasPressed = false;
 
         if (pressDuration >= 50 && pressDuration < 800) {
-            // SHORT PRESS: Toggle Play / Pause
             isPaused = !isPaused;
-            if (isPaused) {
-                updateDisplay("Paused", playlist[currentTrackIndex]);
-            } else {
-                updateDisplay("Playing", playlist[currentTrackIndex]);
-            }
+            const char* statusStr = isPaused ? "Paused" : "Playing";
+            updateDisplay(statusStr, playlist[currentTrackIndex]);
         } 
         else if (pressDuration >= 800) {
-            // LONG PRESS: Skip to Next Track
             if (mp3) mp3->stop();
             currentTrackIndex = (currentTrackIndex + 1) % playlist.size();
             playTrack(currentTrackIndex);
@@ -142,11 +152,41 @@ void handleButton() {
     }
 }
 
+// Fixed Volume Button Handler (Active LOW)
+void handleVolumeButton() {
+    // Reads LOW when the button is pressed
+    bool isPressed = (digitalRead(VOL_BUTTON_PIN) == LOW);
+    
+    // Press detected (Debounce trigger)
+    if (isPressed && !volWasPressed && (millis() - volPressTime > 150)) {
+        volPressTime = millis();
+        volWasPressed = true;
+
+        // Cycle through volume levels
+        currentVolIndex = (currentVolIndex + 1) % TOTAL_VOL_STEPS;
+        
+        if (out) {
+            out->SetGain(volumeLevels[currentVolIndex]);
+        }
+
+        Serial.printf("Volume Set to: %d%%\n", volumePercentages[currentVolIndex]);
+
+        const char* statusStr = isPaused ? "Paused" : "Playing";
+        updateDisplay(statusStr, playlist[currentTrackIndex]);
+    }
+
+    // Reset button press state when released
+    if (!isPressed) {
+        volWasPressed = false;
+    }
+}
+
 void setup() {
     Serial.begin(115200);
 
-    // Initialize BOOT button pin
+    // Pin Configurations
     pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+    pinMode(VOL_BUTTON_PIN, INPUT_PULLUP);
 
     // Initialize Display
     Wire.begin(21, 22);
@@ -166,22 +206,21 @@ void setup() {
         while (1);
     }
 
-    // Configure Audio
+    // Configure Audio Hardware
     out = new AudioOutputI2S(0, AudioOutputI2S::INTERNAL_DAC);
     out->SetOutputModeMono(true);
-    out->SetGain(0.08); // Volume level
+    out->SetGain(volumeLevels[currentVolIndex]); // Initialize at default preset
 
     mp3 = new AudioGeneratorMP3();
 
-    // Start Playback
+    // Start First Track
     playTrack(currentTrackIndex);
 }
 
 void loop() {
-    // Monitor button input
-    handleButton();
+    handleBootButton();
+    handleVolumeButton();
 
-    // Process audio stream only when not paused
     if (mp3 && mp3->isRunning() && !isPaused) {
         if (!mp3->loop()) {
             mp3->stop();
