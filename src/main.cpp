@@ -1,260 +1,231 @@
-#include <WiFi.h>
-#include <WebServer.h>
-#include <SD.h>
+#include <Arduino.h>
 #include <SPI.h>
+#include <SD.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include <vector>
 
-// These headers come from the ESP8266Audio library you installed
 #include "AudioFileSourceSD.h"
 #include "AudioGeneratorMP3.h"
 #include "AudioOutputI2S.h"
 
-// Hardware Pin Definitions
+// Hardware Pins
 #define SD_CS 5
-#define BOOT_BUTTON_PIN 0
-#define LED_PIN 2  // Built-in LED on ESP32
+#define BOOT_BUTTON_PIN 0  // Play / Pause / Skip (BOOT button)
+#define VOL_BUTTON_PIN 32  // 3-Pin Volume Cycle Button
 
-// Network Configuration
-const char* AP_SSID = "suicyan";
+// OLED Configuration
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define SCREEN_ADDRESS 0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// Server & Audio Objects
-WebServer server(80);
-File uploadFile;
+// Audio Volume Presets (Gain values safe for PAM8403)
+const float volumeLevels[] = {0.02f, 0.05f, 0.10f, 0.18f, 0.25f};
+const int volumePercentages[] = {8, 20, 40, 72, 100};
+const int TOTAL_VOL_STEPS = 5;
+int currentVolIndex = 1; // Default starting index (0.05f / 20%)
 
-AudioGeneratorMP3 *mp3 = NULL;
-AudioFileSourceSD *file = NULL;
-AudioOutputI2S *out = NULL;
+// Global Audio Objects
+AudioGeneratorMP3 *mp3 = nullptr;
+AudioFileSourceSD *file = nullptr;
+AudioOutputI2S *out = nullptr;
 
-// Playlist and Player State
+// Playlist & Control State
 std::vector<String> playlist;
-int currentTrackIndex = 0;
-bool isPlaying = false;
+size_t currentTrackIndex = 0;
 bool isPaused = false;
 
-// Button Tracking
-bool lastBtnState = HIGH;
-unsigned long btnPressTime = 0;
-bool isPressing = false;
+// Button Debounce States
+unsigned long bootPressTime = 0;
+bool bootWasPressed = false;
 
-// --- Function Declarations ---
-void updatePlaylist();
-void startTrack(int index);
-void stopAudio();
-void togglePlayPause();
-void playNextTrack();
+unsigned long volPressTime = 0;
+bool volWasPressed = false;
 
-// --- Web Server Handlers ---
-void handleRoot() {
-  String html = "<!DOCTYPE html><html><head><title>ESP32 MP3 Player</title>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-  html += "<style>body{font-family:Arial,sans-serif;margin:20px;max-width:500px;}";
-  html += "input[type=file], input[type=submit]{margin:10px 0;padding:12px;width:100%;box-sizing:border-box;}";
-  html += "ul{list-style:none;padding:0;} li{background:#f0f0f0;margin:5px 0;padding:10px;border-radius:4px;}</style></head><body>";
-  html += "<h2>ESP32 MP3 Manager</h2>";
-  html += "<form method='POST' action='/upload' enctype='multipart/form-data'>";
-  html += "<input type='file' name='upload' accept='.mp3' required>";
-  html += "<input type='submit' value='Upload MP3 to SD Card'>";
-  html += "</form><hr><h3>Playlist on SD Card:</h3><ul>";
-
-  if (playlist.empty()) {
-    html += "<li>No .mp3 files found!</li>";
-  } else {
-    for (size_t i = 0; i < playlist.size(); i++) {
-      html += "<li>";
-      if ((int)i == currentTrackIndex && isPlaying) {
-        html += "<strong>&#9654; " + playlist[i] + "</strong>";
-      } else {
-        html += playlist[i];
-      }
-      html += "</li>";
-    }
-  }
-  html += "</ul></body></html>";
-
-  server.send(200, "text/html", html);
-}
-
-void handleFileUpload() {
-  HTTPUpload& upload = server.upload();
-
-  if (upload.status == UPLOAD_FILE_START) {
-    String filename = upload.filename;
-    if (!filename.startsWith("/")) filename = "/" + filename;
-
-    // Pause audio while writing to SD to avoid glitches
-    if (isPlaying && !isPaused) isPaused = true;
-
-    if (SD.exists(filename)) {
-      SD.remove(filename);
-    }
-    uploadFile = SD.open(filename, FILE_WRITE);
-
-  } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (uploadFile) {
-      uploadFile.write(upload.buf, upload.currentSize);
-    }
-
-  } else if (upload.status == UPLOAD_FILE_END) {
-    if (uploadFile) {
-      uploadFile.close();
-      Serial.println("Upload complete.");
-      updatePlaylist(); // Refresh playlist with new file
-    }
-  }
-}
-
-// --- Audio Player Controls ---
-void updatePlaylist() {
-  playlist.clear();
-  File root = SD.open("/");
-  if (!root) return;
-  
-  File f = root.openNextFile();
-  while (f) {
-    if (!f.isDirectory()) {
-      String name = String(f.name());
-      if (name.endsWith(".mp3") || name.endsWith(".MP3")) {
-        if (name.startsWith("/")) name = name.substring(1);
-        playlist.push_back(name);
-      }
-    }
-    f = root.openNextFile();
-  }
-  root.close();
-  Serial.printf("Found %d MP3 files.\n", playlist.size());
-}
-
-void stopAudio() {
-  if (mp3) {
-    if (mp3->isRunning()) mp3->stop();
-    delete mp3;
-    mp3 = NULL;
-  }
-  if (file) {
-    delete file;
-    file = NULL;
-  }
-  isPlaying = false;
-  isPaused = false;
-}
-
-void startTrack(int index) {
-  stopAudio();
-  if (playlist.empty()) return;
-
-  currentTrackIndex = index % playlist.size();
-  String path = "/" + playlist[currentTrackIndex];
-  Serial.print("Now Playing: "); Serial.println(path);
-
-  file = new AudioFileSourceSD(path.c_str());
-  mp3 = new AudioGeneratorMP3();
-  mp3->begin(file, out);
-  
-  isPlaying = true;
-  isPaused = false;
-}
-
-void togglePlayPause() {
-  if (playlist.empty()) updatePlaylist();
-  if (playlist.empty()) return;
-
-  if (!isPlaying) {
-    startTrack(currentTrackIndex);
-  } else {
-    isPaused = !isPaused;
-    Serial.println(isPaused ? "Playback Paused" : "Playback Resumed");
-  }
-}
-
-void playNextTrack() {
-  if (playlist.empty()) updatePlaylist();
-  if (playlist.empty()) return;
-
-  startTrack(currentTrackIndex + 1);
-}
-
-// --- Button Logic ---
-void handleButton() {
-  bool currentState = digitalRead(BOOT_BUTTON_PIN);
-
-  // Button pressed down
-  if (lastBtnState == HIGH && currentState == LOW) {
-    btnPressTime = millis();
-    isPressing = true;
-  }
-
-  // Button released
-  if (lastBtnState == LOW && currentState == HIGH && isPressing) {
-    unsigned long duration = millis() - btnPressTime;
-    if (duration > 50) { // Debounce filter
-      if (duration < 600) {
-        Serial.println("[Button] Short Press: Play/Pause");
-        togglePlayPause();
-      } else {
-        Serial.println("[Button] Long Press: Next Track");
-        playNextTrack();
-      }
-    }
-    isPressing = false;
-  }
-  lastBtnState = currentState;
-}
-
-// --- Arduino Setup & Loop ---
-void setup() {
-  Serial.begin(115200);
-  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW); // Start with LED turned off
-
-  // 1. ALWAYS START WI-FI FIRST (Prevents Wi-Fi from failing if SD card is missing)
-  WiFi.softAP(AP_SSID);
-  Serial.println("\nOpen Hotspot Started!");
-  Serial.print("Connect to Wi-Fi: "); Serial.println(AP_SSID);
-  Serial.print("Web Interface: http://"); Serial.println(WiFi.softAPIP());
-
-  // 2. INITIALIZE AUDIO OUTPUT ON GPIO 25 (Internal DAC)
-  out = new AudioOutputI2S(0, AudioOutputI2S::INTERNAL_DAC);
-
-  // 3. INITIALIZE SD CARD WITH ERROR LED BLINK
-  if (!SD.begin(SD_CS)) {
-    Serial.println("❌ SD Card Mount Failed!");
-    Serial.println("Blinking built-in LED to signal error. Please check card/wiring and reset.");
+void updateDisplay(const char* status, String trackName) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
     
-    // Fast blink loop if SD card mounting fails
-    while (true) {
-      digitalWrite(LED_PIN, HIGH);
-      delay(150);
-      digitalWrite(LED_PIN, LOW);
-      delay(150);
-      // We still handle client so you can see the AP, though you can't upload without the SD card.
-      server.handleClient(); 
+    // Header
+    display.setCursor(0, 0);
+    display.println(">> ESP32 MUSIC PLAYER <<");
+    display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+
+    // Clean leading slash for display
+    if (trackName.startsWith("/")) {
+        trackName = trackName.substring(1);
     }
-  }
 
-  Serial.println("✅ SD Card mounted successfully.");
-  updatePlaylist();
+    // Track Name
+    display.setCursor(0, 22);
+    display.print("Track: ");
+    display.println(trackName);
 
-  // 4. SERVER ROUTES
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/upload", HTTP_POST, []() {
-    server.send(200, "text/html", "<h3>Upload Successful!</h3><a href='/'>Back to Player</a>");
-  }, handleFileUpload);
+    // Volume Level Display
+    display.setCursor(0, 38);
+    display.print("Volume: ");
+    display.print(volumePercentages[currentVolIndex]);
+    display.println("%");
 
-  server.begin();
+    // Status / Track Counter
+    display.setCursor(0, 52);
+    display.print("Status: ");
+    display.print(status);
+    
+    if (!playlist.empty()) {
+        display.setCursor(95, 52);
+        display.printf("[%d/%d]", currentTrackIndex + 1, playlist.size());
+    }
+
+    display.display();
+}
+
+void scanSDCard() {
+    File root = SD.open("/");
+    if (!root) return;
+
+    File entry = root.openNextFile();
+    while (entry) {
+        if (!entry.isDirectory()) {
+            String filename = String(entry.name());
+            if (!filename.startsWith("/")) filename = "/" + filename;
+            
+            String lowerName = filename;
+            lowerName.toLowerCase();
+            if (lowerName.endsWith(".mp3") && !filename.startsWith("/._")) {
+                playlist.push_back(filename);
+            }
+        }
+        entry.close();
+        entry = root.openNextFile();
+    }
+    root.close();
+}
+
+void playTrack(size_t index) {
+    if (playlist.empty()) return;
+
+    isPaused = false;
+
+    if (file) {
+        delete file;
+        file = nullptr;
+    }
+
+    String path = playlist[index];
+    file = new AudioFileSourceSD(path.c_str());
+    
+    if (mp3->begin(file, out)) {
+        updateDisplay("Playing", path);
+    } else {
+        updateDisplay("Skip Error", path);
+    }
+}
+
+// Handles Play / Pause (Short Press) and Skip Track (Long Press)
+void handleBootButton() {
+    bool isPressed = (digitalRead(BOOT_BUTTON_PIN) == LOW);
+
+    if (isPressed && !bootWasPressed) {
+        bootPressTime = millis();
+        bootWasPressed = true;
+    }
+
+    if (!isPressed && bootWasPressed) {
+        unsigned long pressDuration = millis() - bootPressTime;
+        bootWasPressed = false;
+
+        if (pressDuration >= 50 && pressDuration < 800) {
+            isPaused = !isPaused;
+            const char* statusStr = isPaused ? "Paused" : "Playing";
+            updateDisplay(statusStr, playlist[currentTrackIndex]);
+        } 
+        else if (pressDuration >= 800) {
+            if (mp3) mp3->stop();
+            currentTrackIndex = (currentTrackIndex + 1) % playlist.size();
+            playTrack(currentTrackIndex);
+        }
+    }
+}
+
+// Fixed Volume Button Handler (Active LOW)
+void handleVolumeButton() {
+    // Reads LOW when the button is pressed
+    bool isPressed = (digitalRead(VOL_BUTTON_PIN) == LOW);
+    
+    // Press detected (Debounce trigger)
+    if (isPressed && !volWasPressed && (millis() - volPressTime > 150)) {
+        volPressTime = millis();
+        volWasPressed = true;
+
+        // Cycle through volume levels
+        currentVolIndex = (currentVolIndex + 1) % TOTAL_VOL_STEPS;
+        
+        if (out) {
+            out->SetGain(volumeLevels[currentVolIndex]);
+        }
+
+        Serial.printf("Volume Set to: %d%%\n", volumePercentages[currentVolIndex]);
+
+        const char* statusStr = isPaused ? "Paused" : "Playing";
+        updateDisplay(statusStr, playlist[currentTrackIndex]);
+    }
+
+    // Reset button press state when released
+    if (!isPressed) {
+        volWasPressed = false;
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+
+    // Pin Configurations
+    pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+    pinMode(VOL_BUTTON_PIN, INPUT_PULLUP);
+
+    // Initialize Display
+    Wire.begin(21, 22);
+    display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
+    updateDisplay("Initializing...", "None");
+
+    // Initialize SD Card
+    if (!SD.begin(SD_CS)) {
+        updateDisplay("SD Error!", "Check Wiring");
+        while (1);
+    }
+
+    scanSDCard();
+
+    if (playlist.empty()) {
+        updateDisplay("No MP3s", "Add files to SD");
+        while (1);
+    }
+
+    // Configure Audio Hardware
+    out = new AudioOutputI2S(0, AudioOutputI2S::INTERNAL_DAC);
+    out->SetOutputModeMono(true);
+    out->SetGain(volumeLevels[currentVolIndex]); // Initialize at default preset
+
+    mp3 = new AudioGeneratorMP3();
+
+    // Start First Track
+    playTrack(currentTrackIndex);
 }
 
 void loop() {
-  server.handleClient();
-  handleButton();
+    handleBootButton();
+    handleVolumeButton();
 
-  // Play audio loop
-  if (isPlaying && !isPaused && mp3 != NULL) {
-    if (mp3->isRunning()) {
-      if (!mp3->loop()) {
-        mp3->stop();
-        playNextTrack(); // Auto-advance to next song
-      }
+    if (mp3 && mp3->isRunning() && !isPaused) {
+        if (!mp3->loop()) {
+            mp3->stop();
+            currentTrackIndex = (currentTrackIndex + 1) % playlist.size();
+            playTrack(currentTrackIndex);
+        }
     }
-  }
 }
